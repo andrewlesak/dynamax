@@ -356,7 +356,7 @@ class SSM(ABC):
                                Float[Array, "num_batches num_timesteps input_dim"]]]=None,
         num_iters: int=50,
         verbose: bool=True,
-        **kwargs  # handle extra/hidden parameters like `coupled_IO_fit` to fit coupled input/output data
+        **kwargs
     ) -> Tuple[ParameterSet, Float[Array, "num_iters"]]:
         r"""Compute parameter MLE/ MAP estimate using Expectation-Maximization (EM).
 
