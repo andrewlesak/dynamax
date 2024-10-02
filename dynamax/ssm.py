@@ -4,6 +4,7 @@ from fastprogress.fastprogress import progress_bar
 from functools import partial
 import jax.numpy as jnp
 import jax.random as jr
+import jax.debug as debug
 from jax import jit, lax, vmap
 from jax.tree_util import tree_map
 from jaxtyping import Float, Array, PyTree
@@ -354,7 +355,8 @@ class SSM(ABC):
         inputs: Optional[Union[Float[Array, "num_timesteps input_dim"],
                                Float[Array, "num_batches num_timesteps input_dim"]]]=None,
         num_iters: int=50,
-        verbose: bool=True
+        verbose: bool=True,
+        **kwargs  # handle extra/hidden parameters like `coupled_IO_fit` to fit coupled input/output data
     ) -> Tuple[ParameterSet, Float[Array, "num_iters"]]:
         r"""Compute parameter MLE/ MAP estimate using Expectation-Maximization (EM).
 
@@ -373,21 +375,33 @@ class SSM(ABC):
             inputs: one or more sequences of corresponding inputs
             num_iters: number of iterations of EM to run
             verbose: whether or not to show a progress bar
-
+            **kwargs: Optional arguments, e.g., 'coupled_IO_fit'
+                - coupled_IO_fit (bool): Allows for handling of coupled input/output data.
+                  That is, we want to simultaneously fit a model to both permutations of 
+                  emissions $y_t$ predicted by inputs $u_t$ and emissions $u_t$ predicted 
+                  by inputs $y_t$. We pass the stacked emissions as $y^{(2)}_t=(y_t,u_t)$ and 
+                  inputs $u^{(2)}_t=(u_t,y_t)$ that we later separate in the function
+                  `_compute_conditional_logliks()` in "abstractions.py". Current implementation 
+                  requires the model specified emission and input dims to be equal, and be half 
+                  of the dims of the passed stacked emissions and inputs (i.e. we split the stacked 
+                  input/output data in half). For an example of a model that can implement this 
+                  feature, see 'ConstrainedLinearRegressionSharedSphericalGaussianHMM'
         Returns:
             tuple of new parameters and log likelihoods over the course of EM iterations.
 
         """
+        # extract `coupled_IO_fit` from kwargs, default to False if not provided
+        coupled_IO_fit = kwargs.get('coupled_IO_fit', False)
 
         # Make sure the emissions and inputs have batch dimensions
-        batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape)
-        batch_inputs = ensure_array_has_batch_dim(inputs, self.inputs_shape)
+        batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape, coupled_IO_fit=coupled_IO_fit)
+        batch_inputs = ensure_array_has_batch_dim(inputs, self.inputs_shape, coupled_IO_fit=coupled_IO_fit)
 
-        @jit
-        def em_step(params, m_step_state):
-            batch_stats, lls = vmap(partial(self.e_step, params))(batch_emissions, batch_inputs)
+        @partial(jit, static_argnames=["coupled_IO_fit"])
+        def em_step(params, m_step_state, coupled_IO_fit=coupled_IO_fit):
+            batch_stats, lls = vmap(partial(self.e_step, params, coupled_IO_fit=coupled_IO_fit))(batch_emissions, batch_inputs)
             lp = self.log_prior(params) + lls.sum()
-            params, m_step_state = self.m_step(params, props, batch_stats, m_step_state)
+            params, m_step_state = partial(self.m_step, coupled_IO_fit=coupled_IO_fit)(params, props, batch_stats, m_step_state)
             # debug.print('e_step: {x}', x=(batch_stats, lls))
             # debug.print('m_step{y}', y=params)
             return params, m_step_state, lp

@@ -12,7 +12,8 @@ from dynamax.utils.optimize import run_gradient_descent
 from dynamax.utils.utils import pytree_slice
 import jax.numpy as jnp
 import jax.random as jr
-from jax import vmap
+from functools import partial
+from jax import jit, lax, vmap
 from jax.tree_util import tree_map
 from jaxtyping import Float, Array, PyTree
 import optax
@@ -394,13 +395,35 @@ class HMMEmissions(ABC):
         """
         raise NotImplementedError
 
-    def _compute_conditional_logliks(self, params, emissions, inputs=None):
+    def _split_coupled_IO(self, emissions, inputs):
+        # split emissions in half along last axis
+        emission_dim = emissions.shape[-1] // 2
+        emissions_1 = emissions[:,:emission_dim]
+        emissions_2 = emissions[:,emission_dim:]  
+        # split inputs in half along last axis
+        input_dim = inputs.shape[-1] // 2
+        inputs_1 = inputs[:,:input_dim]
+        inputs_2 = inputs[:,input_dim:]
+        return emissions_1, emissions_2, inputs_1, inputs_2   
+
+    def _compute_conditional_logliks(self, params, emissions, inputs=None, coupled_IO_fit=False):
         # Compute the log probability for each time step by
         # performing a nested vmap over emission time steps and states.
-        f = lambda emission, inpt: \
-            vmap(lambda state: self.distribution(params, state, inpt).log_prob(emission))(
-                jnp.arange(self.num_states))
-        return vmap(f)(emissions, inputs)
+        if coupled_IO_fit:
+            # split emissions and inputs
+            # for `ConstrainedLinearRegressionSharedSphericalGaussianHMM`, we have emissions_1=inputs_2 and emissions_2=inputs_1
+            emissions_1, emissions_2, inputs_1, inputs_2 = self._split_coupled_IO(emissions, inputs)
+            # get log likelihoods for each pair of input/output
+            def f_coupled_IO(emission_1, emission_2, inpt_1, inpt_2):
+                loglik_1 = vmap(lambda state: self.distribution(params, state, inpt_1).log_prob(emission_1))(jnp.arange(self.num_states))
+                loglik_2 = vmap(lambda state: self.distribution(params, state, inpt_2).log_prob(emission_2))(jnp.arange(self.num_states))
+                return loglik_1 + loglik_2  # combine the log likelihoods by summing them
+            return vmap(f_coupled_IO)(emissions_1, emissions_2, inputs_1, inputs_2)
+        else:
+            f = lambda emission, inpt: \
+                vmap(lambda state: self.distribution(params, state, inpt).log_prob(emission))(
+                    jnp.arange(self.num_states))
+            return vmap(f)(emissions, inputs)
 
     def collect_suff_stats(self,
                            params: ParameterSet,
@@ -437,9 +460,10 @@ class HMMEmissions(ABC):
                props: PropertySet,
                batch_stats: PyTree,
                m_step_state: Any,
-               scale: float=1.0
+               scale: float=1.0,
+               coupled_IO_fit: bool=False
     ) -> ParameterSet:
-        """Perform an M-step on the emission distribution parameters.
+        r"""Perform an M-step on the emission distribution parameters.
 
         Args:
             params: current emission distribution parameters
@@ -447,6 +471,7 @@ class HMMEmissions(ABC):
             batch_stats: PyTree of sufficient statistics from each sequence, as output by :meth:`collect_suff_stats`.
             m_step_state: any state required for the M-step
             scale: how to scale the objective
+            coupled_IO_fit: whether to fit both permutations of coupled input/output time series simultaneously
 
         Returns:
             Parameters that maximize the expected log joint probability.
@@ -462,7 +487,7 @@ class HMMEmissions(ABC):
 
             def _single_expected_log_like(stats):
                 expected_states, emissions, inputs = stats
-                log_likelihoods = self._compute_conditional_logliks(params, emissions, inputs)
+                log_likelihoods = self._compute_conditional_logliks(params, emissions, inputs, coupled_IO_fit=coupled_IO_fit)
                 lp = jnp.sum(expected_states * log_likelihoods)
                 return lp
 
@@ -485,7 +510,7 @@ class HMMEmissions(ABC):
 
 
 class HMM(SSM):
-    """Abstract base class of Hidden Markov Models (HMMs).
+    r"""Abstract base class of Hidden Markov Models (HMMs).
 
     The model is defined as follows
 
@@ -546,33 +571,36 @@ class HMM(SSM):
         lp += self.transition_component.log_prior(params.transitions)
         lp += self.emission_component.log_prior(params.emissions)
         return lp
-
+    
     # The inference functions all need the same arguments
-    def _inference_args(self, params, emissions, inputs):
+    def _inference_args(self, params, emissions, inputs, coupled_IO_fit=False):
         return (self.initial_component._compute_initial_probs(params.initial, inputs),
                 self.transition_component._compute_transition_matrices(params.transitions, inputs),
-                self.emission_component._compute_conditional_logliks(params.emissions, emissions, inputs))
-
+                self.emission_component._compute_conditional_logliks(params.emissions, emissions, inputs, coupled_IO_fit))
+    
     # Convenience wrappers for the inference code
-    def marginal_log_prob(self, params, emissions, inputs=None):
-        post = hmm_filter(*self._inference_args(params, emissions, inputs))
+    def marginal_log_prob(self, params, emissions, inputs=None, coupled_IO_fit=False):
+        post = hmm_filter(*self._inference_args(params, emissions, inputs, coupled_IO_fit))
         return post.marginal_loglik
 
-    def most_likely_states(self, params, emissions, inputs=None):
-        return hmm_posterior_mode(*self._inference_args(params, emissions, inputs))
+    def most_likely_states(self, params, emissions, inputs=None, coupled_IO_fit=False):
+        return hmm_posterior_mode(*self._inference_args(params, emissions, inputs, coupled_IO_fit))
 
-    def filter(self, params, emissions, inputs=None):
-        return hmm_filter(*self._inference_args(params, emissions, inputs))
-
-    def smoother(self, params, emissions, inputs=None):
-        return hmm_smoother(*self._inference_args(params, emissions, inputs))
-
-    # Expectation-maximization (EM) code
-    def e_step(self, params, emissions, inputs=None):
+    def filter(self, params, emissions, inputs=None, coupled_IO_fit=False):
+        return hmm_filter(*self._inference_args(params, emissions, inputs, coupled_IO_fit))
+    
+    def smoother(self, params, emissions, inputs=None, compute_trans_probs=True, return_full=False, coupled_IO_fit=False):
+        return hmm_smoother(*self._inference_args(params, emissions, inputs, coupled_IO_fit), 
+                            compute_trans_probs=compute_trans_probs, 
+                            return_full=return_full)
+    # maybe add two_filter_smoother function to compare posteriors with those obtained in smoother() function?
+    
+    # Expectation-maximization (EM) code  
+    def e_step(self, params, emissions, inputs=None, coupled_IO_fit=False):
         """The E-step computes expected sufficient statistics under the
         posterior. In the generic case, we simply return the posterior itself.
         """
-        args = self._inference_args(params, emissions, inputs)
+        args = self._inference_args(params, emissions, inputs, coupled_IO_fit)
         posterior = hmm_two_filter_smoother(*args)
 
         initial_stats = self.initial_component.collect_suff_stats(params.initial, posterior, inputs)
@@ -590,17 +618,33 @@ class HMM(SSM):
         emissions_m_step_state = self.emission_component.initialize_m_step_state(params.emissions, props.emissions)
         return initial_m_step_state, transitions_m_step_state, emissions_m_step_state
 
-    def m_step(self, params, props, batch_stats, m_step_state):
+    def m_step(self, params, props, batch_stats, m_step_state, coupled_IO_fit=False):
         batch_initial_stats, batch_transition_stats, batch_emission_stats = batch_stats
         initial_m_step_state, transitions_m_step_state, emissions_m_step_state = m_step_state
 
         initial_params, initial_m_step_state = self.initial_component.m_step(params.initial, props.initial, batch_initial_stats, initial_m_step_state)
         transition_params, transitions_m_step_state = self.transition_component.m_step(params.transitions, props.transitions, batch_transition_stats, transitions_m_step_state)
-        emission_params, emissions_m_step_state = self.emission_component.m_step(params.emissions, props.emissions, batch_emission_stats, emissions_m_step_state)
+        if coupled_IO_fit:
+            m_step_partial = partial(self.emission_component.m_step, coupled_IO_fit=coupled_IO_fit)
+        else:
+            m_step_partial = self.emission_component.m_step
+        emission_params, emissions_m_step_state = m_step_partial(params.emissions, props.emissions, batch_emission_stats, emissions_m_step_state)
         params = params._replace(initial=initial_params, transitions=transition_params, emissions=emission_params)
         m_step_state = initial_m_step_state, transitions_m_step_state, emissions_m_step_state
         return params, m_step_state
 
+    def permute(self, params: HMMParameterSet, perm: jnp.ndarray) -> HMMParameterSet:
+        """Permute the states of the HMM model in-place according to a permutation."""
+        if isinstance(perm, list): 
+            perm = jnp.array(perm)  # convert perm list to array
+        # ensure permutation has correct length and is 1-dimensional
+        assert perm.ndim == 1, f"Permutation must be 1-dimensional, but got {perm.ndim}-dimensional array."
+        assert len(perm) == self.num_states, f"Permutation length {len(perm)} does not match the number of states {self.num_states}."
+        # permute model params
+        permuted_initial = params.initial._replace(probs=params.initial.probs[perm])
+        permuted_transitions = params.transitions._replace(transition_matrix=params.transitions.transition_matrix[perm][:, perm])
+        permuted_emissions = self.emission_component.permute(params.emissions, perm)
+        return params._replace(initial=permuted_initial, transitions=permuted_transitions, emissions=permuted_emissions)
 
 # class ExponentialFamilyHMM(HMM):
 #     """
