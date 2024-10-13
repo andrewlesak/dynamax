@@ -97,7 +97,7 @@ def random_rotation(seed, n, theta=None):
     return q.dot(out).dot(q.T)
 
 
-def ensure_array_has_batch_dim(tree, instance_shapes):
+def ensure_array_has_batch_dim(tree, instance_shapes, coupled_IO_fit=False):    
     """Add a batch dimension to a PyTree, if necessary.
 
     Example: If `tree` is an array of shape (T, D) where `T` is
@@ -125,12 +125,28 @@ def ensure_array_has_batch_dim(tree, instance_shapes):
         instance_shape (_type_): matching PyTree where the "leaves" are
             tuples of integers specifying the shape of one "instance" or
             entry in the array.
+
+        coupled_IO_fit (bool): Allows for handling of coupled input/output data.
+            That is, we want to simultaneously fit a model to both permutations of 
+            emissions $y_t$ predicted by inputs $u_t$ and emissions $u_t$ predicted 
+            by inputs $y_t$. We pass the stacked emissions as $y^{(2)}_t=(y_t,u_t)$ and 
+            inputs $u^{(2)}_t=(u_t,y_t)$ that we later split in the function
+            `_compute_conditional_logliks()` in "abstractions.py". Current implementation 
+            requires the emission and input dims must be equal.
     """
     def _expand_dim(x, shp):
         ndim = len(shp)
-        assert x.ndim > ndim, "array does not match expected shape!"
-        assert all([(d1 == d2) for d1, d2 in zip(x.shape[-ndim:], shp)]), \
-            "array does not match expected shape!"
+        assert x.ndim > ndim, "Array does not match expected shape!"
+        if coupled_IO_fit:
+            # assumes that inputs and emissions have same dims and are stacked, having twice the model dimension
+            assert x.shape[-1] % 2 == 0, "coupled_IO_fit requires passed stacked input/emission dims to be even."
+            assert shp[-1] * 2 == x.shape[-1], "coupled_IO_fit requires stacked inputs/emissions to have dimensions twice that of the model input/emission dim."
+            stacked_shape = (shp[-1] * 2,)
+            assert all([(d1 == d2) for d1, d2 in zip(x.shape[-ndim:], stacked_shape)]), \
+                "Array does not match expected shape for coupled input/output data!"
+        else:
+            assert all([(d1 == d2) for d1, d2 in zip(x.shape[-ndim:], shp)]), \
+                "Array does not match expected shape!"
 
         if x.ndim == ndim + 2:
             # x already has a batch dim
