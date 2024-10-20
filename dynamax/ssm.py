@@ -507,6 +507,76 @@ class SSM(ABC):
 
         return params, log_probs[1:]     
 
+
+##########
+
+    def fit_em_while2(
+        self,
+        params: ParameterSet,
+        props: PropertySet,
+        emissions: Union[Float[Array, "num_timesteps emission_dim"],
+                         Float[Array, "num_batches num_timesteps emission_dim"]],
+        inputs: Optional[Union[Float[Array, "num_timesteps input_dim"],
+                               Float[Array, "num_batches num_timesteps input_dim"]]]=None,
+        num_iters: int=50,
+        tolerance: float=0,
+        fit_id: int=0,
+        verbose: bool=True,
+        **kwargs
+    ) -> Tuple[ParameterSet, Float[Array, "num_iters"]]:
+        r"""Compute parameter MLE/ MAP estimate using Expectation-Maximization (EM)."""
+
+        from dynamax.utils.progress import while_tqdm2
+
+        # extract `coupled_IO_fit` from kwargs, default to False if not provided
+        coupled_IO_fit = kwargs.get('coupled_IO_fit', False)
+
+        # Make sure the emissions and inputs have batch dimensions
+        batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape, coupled_IO_fit=coupled_IO_fit)
+        batch_inputs = ensure_array_has_batch_dim(inputs, self.inputs_shape, coupled_IO_fit=coupled_IO_fit)
+
+        @partial(jit, static_argnames=["coupled_IO_fit"])
+        def em_step(params, m_step_state, coupled_IO_fit=coupled_IO_fit):
+            batch_stats, lls = vmap(partial(self.e_step, params, coupled_IO_fit=coupled_IO_fit))(batch_emissions, batch_inputs)
+            lp = self.log_prior(params) + lls.sum()
+            params, m_step_state = partial(self.m_step, coupled_IO_fit=coupled_IO_fit)(params, props, batch_stats, m_step_state)
+            # debug.print('e_step: {x}', x=(batch_stats, lls))
+            # debug.print('m_step{y}', y=params)
+            return params, m_step_state, lp
+
+        def _check_cond(iter_num, delta_lp):
+            return (delta_lp >= tolerance) & (iter_num < num_iters)
+        
+        def _cond_fun(carry):
+            iter_num, *_, delta_lp = carry
+            debug.print("cond iter = {}",iter_num)
+            return _check_cond(iter_num, delta_lp)
+
+        @while_tqdm2(num_iters, print_rate=1, bar_id=fit_id, disable=jnp.logical_not(verbose))
+        def _update_fun(carry):
+            iter_num, converged, params, m_step_state, log_probs, delta_lp = carry
+            debug.print("iter = {}",iter_num)
+            params, m_step_state, lp = em_step(params, m_step_state)
+            log_probs = log_probs.at[iter_num + 1].set(lp)
+            delta_lp = jnp.abs(log_probs[iter_num + 1] - log_probs[iter_num])
+            converged = jnp.logical_not(_check_cond(iter_num, delta_lp))
+            return (iter_num + 1, converged, params, m_step_state, log_probs, delta_lp)
+
+        m_step_state = self.initialize_m_step_state(params, props)
+        log_probs = jnp.zeros(num_iters + 1) - jnp.inf
+        init_carry = (0, False, params, m_step_state, log_probs, jnp.inf)
+
+        # run loop, then perform final pbar update
+        results = lax.while_loop(_cond_fun, _update_fun, init_carry)
+        final_iter, _, params, m_step_state, log_probs, delta_lp = results
+        # final_converged = jnp.logical_not(_check_cond(final_iter, delta_lp))
+        # _update_fun.final_update(final_iter, final_converged)
+
+        return params, log_probs[1:]  
+
+##########
+
+
     def fit_sgd(
         self,
         params: ParameterSet,
