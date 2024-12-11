@@ -10,7 +10,7 @@ from dynamax.hidden_markov_model.models.transitions import StandardHMMTransition
 from dynamax.parameters import ParameterProperties
 from dynamax.types import Scalar
 from dynamax.utils.utils import pytree_sum
-from dynamax.utils.bijectors import RealToPSDBijector
+from dynamax.utils.bijectors import RealToPSDBijector, BoundedBijector
 from tensorflow_probability.substrates import jax as tfp
 from typing import NamedTuple, Optional, Tuple, Union
 
@@ -227,12 +227,13 @@ class LinearRegressionHMM(HMM):
 
 
 # -- Define constrained linear regression/model HMM (aka cLM-HMM) --
-# weights matrix is Toeplitz with optional flag for symmetric (thus the dynamic_dim)
+# weights matrix is Toeplitz with optional flag for symmetric (thus the dynamic_weights_dim)
+# biases can be tied across states with optional flag (thus the dynamic_bias_dim)
 # coupled_IO_fit allows for fitting both permutations of coupled input/output data
 
 class ParamsConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(NamedTuple):
-    flat_weights: Union[Float[Array, "state_dim dynamic_dim"], ParameterProperties]
-    biases: Union[Float[Array, "state_dim"], ParameterProperties]
+    flat_weights: Union[Float[Array, "state_dim dynamic_weights_dim"], ParameterProperties]
+    biases: Union[Float[Array, "dynamic_bias_dim"], ParameterProperties]
     scales: Union[Float[Array, "1"], ParameterProperties]
 
 
@@ -248,7 +249,9 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
                  input_dim,
                  emission_dim,
                  symmetric=False,
+                 tied_bias=False,
                  coupled_IO_fit=False,
+                 bias_bounds=(-jnp.inf, jnp.inf),
                  m_step_optimizer=optax.adam(1e-2),
                  m_step_num_iters=50):
         super().__init__(m_step_optimizer=m_step_optimizer, m_step_num_iters=m_step_num_iters)
@@ -259,6 +262,8 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
             input_dim: Dimensionality of inputs
             emission_dim: Dimensionality of emissions (should be equal to input_dim)
             symmetric: If True, use Symmetric Toeplitz, otherwise use standard Toeplitz
+            tied_bias: If True, share single bias across all states.
+            bias_bounds: Tuple = (lower_bound, upper_bound)
             coupled_IO_fit: If True, fit both permutations of coupled input/output data simultaneously
         """
         if coupled_IO_fit:
@@ -269,9 +274,14 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
         self.input_dim = input_dim
         self.emission_dim = emission_dim
         self.symmetric = symmetric
+        self.tied_bias = tied_bias
+        self.bias_bounds = bias_bounds
 
-        # dynamic dimension: emission_dim if symmetric, otherwise emission_dim + input_dim - 1
-        self.dynamic_dim = self.emission_dim if self.symmetric else self.emission_dim + self.input_dim - 1
+        # dynamic weights dimension: emission_dim if symmetric, otherwise emission_dim + input_dim - 1
+        self.dynamic_weights_dim = self.emission_dim if self.symmetric else self.emission_dim + self.input_dim - 1
+
+        # dynamic bias dimension: 1 if tied_bias, otherwise num_states
+        self.dynamic_bias_dim = 1 if self.tied_bias else self.num_states
 
     @property
     def emission_shape(self):
@@ -300,8 +310,8 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
         
         elif method.lower() == "random":
             key1, key2, key3 = jr.split(key, 3)
-            _emission_flat_weights = 0.01 * jr.normal(key1, (self.num_states, self.dynamic_dim))
-            _emission_biases = jr.normal(key2, (self.num_states,))
+            _emission_flat_weights = 0.01 * jr.normal(key1, (self.num_states, self.dynamic_weights_dim))
+            _emission_biases = jr.normal(key2, (self.dynamic_bias_dim,))
             _emission_scales = jnp.ones((1,))
             
         else:
@@ -316,7 +326,7 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
 
         props = ParamsConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(
             flat_weights=ParameterProperties(),
-            biases=ParameterProperties(),
+            biases=ParameterProperties(constrainer=BoundedBijector(lower_bound=self.bias_bounds[0], upper_bound=self.bias_bounds[1])),
             scales=ParameterProperties(constrainer=tfb.Softplus()))  # positive value constraint
         return params, props        
 
@@ -335,7 +345,11 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
         # get weights
         Wks = self.get_weights(params.flat_weights)
         prediction = jnp.matmul(inputs, Wks[state])
-        prediction += params.biases[state] * jnp.ones((self.emission_dim,))
+        if self.tied_bias:
+            prediction += params.biases[0] * jnp.ones((self.emission_dim,))
+        else:
+            prediction += params.biases[state] * jnp.ones((self.emission_dim,))
+
         return tfd.MultivariateNormalDiag(prediction, params.scales[0] * jnp.ones((self.emission_dim,)))
     
     def log_prior(self, params):
@@ -344,7 +358,7 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
     def permute(self, params, perm):
         """Permute the emissions parameters based on a permutation of the latent states."""
         permuted_flat_weights = params.flat_weights[perm]
-        permuted_biases = params.biases[perm]
+        permuted_biases = params.biases if self.tied_bias else params.biases[perm]
         return ParamsConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(
             flat_weights=permuted_flat_weights, 
             biases=permuted_biases,
@@ -383,6 +397,8 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMM(HMM):
     :param input_dim: input dimension $M$
     :param emission_dim: emission dimension $N$
     :param symmetric: optionally constrain Toeplitz weights matrix to be symmetric
+    :param tied_bias: optionally share single bias across all states
+    :param bias_bounds: optionally set (lower_bound, upper_bound) bounds on biases
     :param coupled_IO_fit: fit both permutations of coupled input/output data 
     :param initial_probs_concentration: $\alpha$
     :param transition_matrix_concentration: $\beta$
@@ -394,7 +410,9 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMM(HMM):
                  inputs_dim: int,
                  emissions_dim: int,
                  symmetric: bool=False,
+                 tied_bias: bool=False,
                  coupled_IO_fit: bool=False,
+                 bias_bounds: tuple=(-jnp.inf, jnp.inf),
                  initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
                  transition_matrix_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
                  transition_matrix_stickiness: Scalar=0.0,
@@ -406,7 +424,9 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMM(HMM):
         transition_component = StandardHMMTransitions(num_states, concentration=transition_matrix_concentration, stickiness=transition_matrix_stickiness)
         emission_component = ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(num_states, inputs_dim, emissions_dim, 
                                                                                             symmetric=symmetric,
+                                                                                            tied_bias=tied_bias,
                                                                                             coupled_IO_fit=coupled_IO_fit,
+                                                                                            bias_bounds=bias_bounds,
                                                                                             m_step_optimizer=m_step_optimizer,
                                                                                             m_step_num_iters=m_step_num_iters)
         super().__init__(num_states, initial_component, transition_component, emission_component)
@@ -424,11 +444,11 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMM(HMM):
                    method: str="random",
                    initial_probs: Optional[Float[Array, "num_states"]]=None,
                    transition_matrix: Optional[Float[Array, "num_states num_states"]]=None,
-                   emission_flat_weights: Optional[Float[Array, "num_states dynamic_dim"]]=None,
-                   emission_biases: Optional[Float[Array, "num_states"]]=None,
-                   emission_scales:  Optional[Float[Array, "1"]]=None,
-                   emissions:  Optional[Float[Array, "num_timesteps emission_dim"]]=None,
-                   inputs:  Optional[Float[Array, "num_timesteps input_dim"]]=None
+                   emission_flat_weights: Optional[Float[Array, "num_states dynamic_weights_dim"]]=None,
+                   emission_biases: Optional[Float[Array, "dynamic_bias_dim"]]=None,
+                   emission_scales: Optional[Float[Array, "1"]]=None,
+                   emissions: Optional[Float[Array, "num_timesteps emission_dim"]]=None,
+                   inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None
         ) -> Tuple[HMMParameterSet, HMMPropertySet]:
         """Initialize the model parameters and their corresponding properties.
 
