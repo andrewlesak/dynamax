@@ -4,7 +4,7 @@ from dynamax.hidden_markov_model.models.bernoulli_hmm import BernoulliHMM
 from dynamax.hidden_markov_model.models.categorical_glm_hmm import CategoricalRegressionHMM
 from dynamax.hidden_markov_model.models.categorical_hmm import CategoricalHMM
 from dynamax.hidden_markov_model.models.gamma_hmm import GammaHMM
-from dynamax.hidden_markov_model.models.gaussian_hmm import GaussianHMM, DiagonalGaussianHMM, SphericalGaussianHMM, SharedCovarianceGaussianHMM, LowRankGaussianHMM
+from dynamax.hidden_markov_model.models.gaussian_hmm import GaussianHMM, DiagonalGaussianHMM, SphericalGaussianHMM, SharedCovarianceGaussianHMM, LowRankGaussianHMM, GenericOptimizerDiagonalGaussianHMM
 from dynamax.hidden_markov_model.models.gmm_hmm import GaussianMixtureHMM, DiagonalGaussianMixtureHMM
 from dynamax.hidden_markov_model.models.linreg_hmm import LinearRegressionHMM, ConstrainedLinearRegressionSharedSphericalGaussianHMM
 from dynamax.hidden_markov_model.models.logreg_hmm import LogisticRegressionHMM

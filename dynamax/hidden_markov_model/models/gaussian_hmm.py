@@ -1029,3 +1029,159 @@ class LowRankGaussianHMM(HMM):
         params["transitions"], props["transitions"] = self.transition_component.initialize(key2, method=method, transition_matrix=transition_matrix)
         params["emissions"], props["emissions"] = self.emission_component.initialize(key3, method=method, emission_means=emission_means, emission_cov_diag_factors=emission_cov_diag_factors, emission_cov_low_rank_factors=emission_cov_low_rank_factors, emissions=emissions)
         return ParamsLowRankGaussianHMM(**params), ParamsLowRankGaussianHMM(**props)
+
+
+## ---------------------------------------------------------------------------
+## define flexible diagonal gaussian HMM that uses generic optimizer 
+## (optional diagonal or spherical covariance with optionally tied covariance)
+## ---------------------------------------------------------------------------
+
+class ParamsGenericOptimizerDiagonalGaussianHMMEmissions(NamedTuple):
+    means: Union[Float[Array, "state_dim emission_dim"], ParameterProperties]
+    covs: Union[Float[Array, "dynamic_state_dim dynamic_emis_dim"], ParameterProperties]
+
+
+class ParamsGenericOptimizerDiagonalGaussianHMM(NamedTuple):
+    initial: ParamsStandardHMMInitialState
+    transitions: ParamsStandardHMMTransitions
+    emissions: ParamsGenericOptimizerDiagonalGaussianHMMEmissions
+
+
+class GenericOptimizerDiagonalGaussianHMMEmissions(HMMEmissions):
+
+    def __init__(self,
+                 num_states,
+                 emission_dim,
+                 tied_cov=False,
+                 spherical=False,
+                 m_step_optimizer=optax.adam(1e-2),
+                 m_step_num_iters=50):
+        super().__init__(m_step_optimizer=m_step_optimizer, m_step_num_iters=m_step_num_iters)
+
+        self.num_states = num_states
+        self.emission_dim = emission_dim
+        self.tied_cov = tied_cov
+        self.spherical = spherical
+        self.dynamic_state_dim = 1 if self.tied_cov else self.num_states
+        self.dynamic_emis_dim = 1 if self.spherical else self.emission_dim
+
+    @property
+    def emission_shape(self):
+        return (self.emission_dim,)
+
+    def initialize(self, 
+                   key=jr.PRNGKey(0),
+                   method="random",
+                   emission_means=None,
+                   emission_covariances=None,
+                   emissions=None):
+        if method.lower() == "kmeans":
+            assert emissions is not None, "Need emissions to initialize the model with K-Means!"
+            from sklearn.cluster import KMeans
+            key, subkey = jr.split(key)  # Create a random seed for SKLearn.
+            sklearn_key = jr.randint(subkey, shape=(), minval=0, maxval=2147483647)  # Max int32 value.
+            km = KMeans(self.num_states, random_state=int(sklearn_key)).fit(emissions.reshape(-1, self.emission_dim))
+
+            _emission_means = jnp.array(km.cluster_centers_)
+            _emission_covs = jnp.tile(jnp.ones(self.dynamic_emis_dim), (self.dynamic_state_dim,1))
+
+        elif method.lower() == "prior": 
+            # TODO: Use an MNIW prior
+            raise Exception("{} method not implemented yet".format(method))
+
+        elif method.lower() == "random":
+            key1, key2 = jr.split(key, 2)
+            _emission_means = 0.01 * jr.normal(key1, (self.num_states, self.emission_dim))
+            _emission_covs = jr.normal(key2, (self.dynamic_state_dim, self.dynamic_emis_dim))
+
+        else:
+            raise Exception("Invalid initialization method: {}".format(method))
+
+        # Only use the values above if the user hasn't specified their own
+        default = lambda x, x0: x if x is not None else x0
+        params = ParamsGenericOptimizerDiagonalGaussianHMMEmissions(
+            means=default(emission_means, _emission_means),
+            covs=default(emission_covariances, _emission_covs))
+
+        props = ParamsGenericOptimizerDiagonalGaussianHMMEmissions(
+            means=ParameterProperties(),
+            covs=ParameterProperties(constrainer=tfb.Softplus()))
+        return params, props
+
+    def distribution(self, params, state, inputs=None):
+        mean = params.means[state]
+        state = 0 if self.tied_cov else state
+        cov = params.covs[state] * jnp.ones((self.emission_dim,)) if self.spherical else params.covs[state] 
+        return tfd.MultivariateNormalDiag(mean, cov)
+
+    def log_prior(self, params):
+        return 0.0
+
+    def permute(self, params, perm):
+        """Permute the emissions parameters based on a permutation of the latent states."""
+        permuted_means = params.means[perm]
+        permuted_covs = params.covs if self.tied_cov else params.covs[perm]
+        return ParamsGenericOptimizerDiagonalGaussianHMMEmissions(
+            means=permuted_means, 
+            covs=permuted_covs)
+
+
+class GenericOptimizerDiagonalGaussianHMM(HMM):
+
+    def __init__(self, 
+                 num_states: int,
+                 emission_dim: int,
+                 tied_cov: bool=False,
+                 spherical: bool=False,
+                 initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_stickiness: Scalar=0.0,
+                 m_step_optimizer: optax.GradientTransformation=optax.adam(1e-2),
+                 m_step_num_iters: int=50):
+        self.emission_dim = emission_dim
+        initial_component = StandardHMMInitialState(num_states, initial_probs_concentration=initial_probs_concentration)
+        transition_component = StandardHMMTransitions(num_states, concentration=transition_matrix_concentration, stickiness=transition_matrix_stickiness)
+        emission_component = GenericOptimizerDiagonalGaussianHMMEmissions(
+            num_states, 
+            emission_dim, 
+            tied_cov=tied_cov,
+            spherical=spherical,
+            m_step_optimizer=m_step_optimizer, 
+            m_step_num_iters=m_step_num_iters)
+
+        super().__init__(num_states, initial_component, transition_component, emission_component)
+
+    def initialize(self,
+                   key: jr.PRNGKey=jr.PRNGKey(0),
+                   method: str="random",
+                   initial_probs: Optional[Float[Array, "num_states"]]=None,
+                   transition_matrix: Optional[Float[Array, "num_states num_states"]]=None,
+                   emission_means: Optional[Float[Array, "num_states emission_dim"]]=None,
+                   emission_covariances:  Optional[Float[Array, "dynamic_state_dim dynamic_emis_dim"]]=None,
+                   emissions:  Optional[Float[Array, "num_timesteps emission_dim"]]=None
+        ) -> Tuple[HMMParameterSet, HMMPropertySet]:
+        """Initialize the model parameters and their corresponding properties.
+
+        You can either specify parameters manually via the keyword arguments, or you can have
+        them set automatically. If any parameters are not specified, you must supply a PRNGKey.
+        Parameters will then be sampled from the prior (if `method==prior`).
+
+        Args:
+            key: random number generator for unspecified parameters. Must not be None if there are any unspecified parameters.
+            method: method for initializing unspecified parameters. Both "prior" and "kmeans" are supported.
+            initial_probs: manually specified initial state probabilities.
+            transition_matrix: manually specified transition matrix.
+            emission_means: manually specified emission means.
+            emission_covariances: manually specified emission covariances.
+            emissions: emissions for initializing the parameters with kmeans.
+
+        Returns:
+            Model parameters and their properties.
+
+        """
+        key1, key2, key3 = jr.split(key , 3)
+        params, props = dict(), dict()
+        params["initial"], props["initial"] = self.initial_component.initialize(key1, method=method, initial_probs=initial_probs)
+        params["transitions"], props["transitions"] = self.transition_component.initialize(key2, method=method, transition_matrix=transition_matrix)
+        params["emissions"], props["emissions"] = self.emission_component.initialize(key3, method=method, emission_means=emission_means, emission_covariances=emission_covariances, emissions=emissions)
+        return ParamsGenericOptimizerDiagonalGaussianHMM(**params), ParamsGenericOptimizerDiagonalGaussianHMM(**props)
