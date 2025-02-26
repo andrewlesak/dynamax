@@ -473,3 +473,170 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMM(HMM):
         params["emissions"], props["emissions"] = self.emission_component.initialize(key3, method=method, emission_flat_weights=emission_flat_weights, emission_biases=emission_biases, emission_scales=emission_scales, emissions=emissions, inputs=inputs)
         return ParamsConstrainedLinearRegressionSharedSphericalGaussianHMM(**params), ParamsConstrainedLinearRegressionSharedSphericalGaussianHMM(**props)
     
+
+
+## ----------------------------------------------------------------------------------
+## ----------------------------------------------------------------------------------
+## ------ spherical cov, optionally const and tied bias, unconstrained weights ------
+## ----------------------------------------------------------------------------------
+## ----------------------------------------------------------------------------------
+
+class ParamsLinearRegressionSharedSphericalGaussianHMMEmissions(NamedTuple):
+    weights: Union[Float[Array, "state_dim emission_dim input_dim"], ParameterProperties]
+    biases: Union[Float[Array, "dynamic_bias_state_dim dynamic_bias_emission_dim"], ParameterProperties]
+    scales: Union[Float[Array, "1"], ParameterProperties]
+
+
+class ParamsLinearRegressionSharedSphericalGaussianHMM(NamedTuple):
+    initial: ParamsStandardHMMInitialState
+    transitions: ParamsStandardHMMTransitions
+    emissions: ParamsLinearRegressionSharedSphericalGaussianHMMEmissions
+
+
+class LinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmissions):
+    def __init__(self,
+                 num_states,
+                 input_dim,
+                 emission_dim,
+                 tied_bias=False,
+                 const_bias=False,
+                 m_step_optimizer=optax.adam(1e-2),
+                 m_step_num_iters=50):
+        super().__init__(m_step_optimizer=m_step_optimizer, m_step_num_iters=m_step_num_iters)
+        """_summary_
+        """
+
+        self.num_states = num_states
+        self.input_dim = input_dim
+        self.emission_dim = emission_dim
+        self.tied_bias = tied_bias
+        self.const_bias = const_bias
+
+        # determine dynamic dimensions of bias (may be constant and tied across states)
+        self.dynamic_bias_state_dim = 1 if self.tied_bias else self.num_states
+        self.dynamic_bias_emission_dim = 1 if self.const_bias else self.emission_dim
+
+    @property
+    def emission_shape(self):
+        return (self.emission_dim,)
+    
+    @property
+    def inputs_shape(self):
+        return (self.input_dim,)
+
+    def initialize(self,
+                   key=jr.PRNGKey(0),
+                   method="random",
+                   emission_weights=None,
+                   emission_biases=None,
+                   emission_scales=None,
+                   emissions=None,
+                   inputs=None):
+        if method.lower() == "kmeans":
+            assert emissions is not None, "Need emissions to initialize the model with K-Means!"
+            from sklearn.cluster import KMeans
+            raise Exception("{} method not implemented yet".format(method))
+
+        elif method.lower() == "prior":
+            # TODO: Use an MNIW prior
+            raise Exception("{} method not implemented yet".format(method))
+        
+        elif method.lower() == "random":
+            key1, key2, key3 = jr.split(key, 3)
+            _emission_weights = 0.01 * jr.normal(key1, (self.num_states, self.emission_dim, self.input_dim))
+            _emission_biases = jr.normal(key2, (self.dynamic_bias_state_dim, self.dynamic_bias_emission_dim,))
+            _emission_scales = jnp.ones((1,))
+            
+        else:
+            raise Exception("Invalid initialization method: {}".format(method))
+
+        # Only use the values above if the user hasn't specified their own
+        default = lambda x, x0: x if x is not None else x0
+        params = ParamsLinearRegressionSharedSphericalGaussianHMMEmissions(
+            weights=default(emission_weights, _emission_weights),
+            biases=default(emission_biases, _emission_biases),
+            scales=default(emission_scales, _emission_scales))
+
+        props = ParamsLinearRegressionSharedSphericalGaussianHMMEmissions(
+            weights=ParameterProperties(),
+            biases=ParameterProperties(),
+            scales=ParameterProperties(constrainer=tfb.Softplus()))  # positive value constraint
+        return params, props        
+
+    def distribution(self, params, state, inputs):
+        prediction = params.weights[state] @ inputs
+        bias = params.biases[0] if self.tied_bias else params.biases[state]
+        if self.const_bias:
+            bias = bias * jnp.ones((self.emission_dim,))
+        prediction += bias
+        return tfd.MultivariateNormalDiag(prediction, params.scales[0] * jnp.ones((self.emission_dim,)))
+
+    def log_prior(self, params):
+        return 0.0
+
+    def permute(self, params, perm):
+        """Permute the emissions parameters based on a permutation of the latent states."""
+        permuted_weights = params.weights[perm]
+        permuted_biases = params.biases if self.tied_bias else params.biases[perm]
+        return ParamsLinearRegressionSharedSphericalGaussianHMMEmissions(
+            weights=permuted_weights, 
+            biases=permuted_biases,
+            scales=params.scales  # scales don't need permutation as its shared across states
+        )
+
+
+class LinearRegressionSharedSphericalGaussianHMM(HMM):
+    r"""_summary_
+    """
+    def __init__(self,
+                 num_states: int,
+                 inputs_dim: int,
+                 emissions_dim: int,
+                 tied_bias: bool=False,
+                 const_bias: bool=False,
+                 initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_stickiness: Scalar=0.0,
+                 m_step_optimizer: optax.GradientTransformation=optax.adam(1e-2),
+                 m_step_num_iters: int=50):
+        self.emissions_dim = emissions_dim
+        self.inputs_dim = inputs_dim
+        initial_component = StandardHMMInitialState(num_states, initial_probs_concentration=initial_probs_concentration)
+        transition_component = StandardHMMTransitions(num_states, concentration=transition_matrix_concentration, stickiness=transition_matrix_stickiness)
+        emission_component = LinearRegressionSharedSphericalGaussianHMMEmissions(
+            num_states, inputs_dim, emissions_dim, 
+            symmetric=symmetric,
+            tied_bias=tied_bias,
+            const_bias=const_bias,
+            m_step_optimizer=m_step_optimizer,
+            m_step_num_iters=m_step_num_iters
+        )
+        super().__init__(num_states, initial_component, transition_component, emission_component)
+    
+    @property
+    def emission_shape(self):
+        return (self.emissions_dim,)
+
+    @property
+    def inputs_shape(self):
+        return (self.inputs_dim,)
+    
+    def initialize(self,
+                   key: jr.PRNGKey=jr.PRNGKey(0),
+                   method: str="random",
+                   initial_probs: Optional[Float[Array, "num_states"]]=None,
+                   transition_matrix: Optional[Float[Array, "num_states num_states"]]=None,
+                   emission_weights: Optional[Float[Array, "num_states emission_dim input_dim"]]=None,
+                   emission_biases: Optional[Float[Array, "dynamic_bias_state_dim dynamic_bias_emission_dim"]]=None,
+                   emission_scales: Optional[Float[Array, "1"]]=None,
+                   emissions: Optional[Float[Array, "num_timesteps emission_dim"]]=None,
+                   inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None
+        ) -> Tuple[HMMParameterSet, HMMPropertySet]:
+        """_summary_
+        """
+        key1, key2, key3 = jr.split(key , 3)
+        params, props = dict(), dict()
+        params["initial"], props["initial"] = self.initial_component.initialize(key1, method=method, initial_probs=initial_probs)
+        params["transitions"], props["transitions"] = self.transition_component.initialize(key2, method=method, transition_matrix=transition_matrix)
+        params["emissions"], props["emissions"] = self.emission_component.initialize(key3, method=method, emission_weights=emission_weights, emission_biases=emission_biases, emission_scales=emission_scales, emissions=emissions, inputs=inputs)
+        return ParamsLinearRegressionSharedSphericalGaussianHMM(**params), ParamsLinearRegressionSharedSphericalGaussianHMM(**props)
