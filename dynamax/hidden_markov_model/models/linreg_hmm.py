@@ -344,7 +344,7 @@ class ConstrainedLinearRegressionSharedSphericalGaussianHMMEmissions(HMMEmission
     def distribution(self, params, state, inputs):
         # get weights
         Wks = self.get_weights(params.flat_weights)
-        prediction = jnp.matmul(inputs, Wks[state])
+        prediction = jnp.matmul(Wks[state], inputs)
         if self.tied_bias:
             prediction += params.biases[0] * jnp.ones((self.emission_dim,))
         else:
